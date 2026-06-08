@@ -1,2 +1,2 @@
 FROM	alpine:latest
-ADD	https://github.com/huangyxi/test-docker.git /tmp
+ADD	https://github.com/huangyxi/test-docker.git /tmp/
