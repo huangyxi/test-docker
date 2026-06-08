@@ -1,6 +1,8 @@
 name: Build and Publish to GHCR
 
 on:
+  schedule:
+    - cron: '0 1 * * *' # Runs daily at 01:00 UTC, after the Sync Upstream Tags workflow for cache optimization
   push:
     branches:
       - main
@@ -10,6 +12,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      claude_code_version:
+        description: 'Specify a custom version of @anthropic-ai/claude-code to build with (e.g., "2.1.168")'
+        required: false
+        default: 'latest'
 
 env:
   REGISTRY: ghcr.io
@@ -17,21 +24,54 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.platform.runner }}
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        platform:
+          - arch: linux/amd64
+            runner: ubuntu-latest
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
+      - name: Prepare environment variables
+        run: |
+          echo "FULL_IMAGE_NAME=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" >> $GITHUB_ENV
+          CLOUDCLI_REF='main'
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            CLOUDCLI_REF='${{ github.ref_name }}'
+          fi
+          echo "CLOUDCLI_REF=${CLOUDCLI_REF}" >> $GITHUB_ENV
+          CLAUDE_CODE_VERSION='${{ github.event.inputs.claude_code_version }}'
+          CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-latest}"
+          [[ $CLAUDE_CODE_VERSION == latest ]] &&
+            CLAUDE_CODE_VERSION="$(npm view @anthropic-ai/claude-code version)"
+          echo "CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION}" >> "$GITHUB_ENV"
       - name: Extract metadata for Docker images
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.FULL_IMAGE_NAME }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+      - name: Extract metadata for Docker cache
+        id: cache-meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.FULL_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            ${{ github.ref_type == 'tag' && 'type=raw,value=main' || '' }}
+          flavor: |
+            prefix=cache-${{ matrix.platform.arch }}-
+            latest=false
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
       - name: Login to GitHub Container Registry
@@ -41,15 +81,32 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
       - name: Checkout repository
         uses: actions/checkout@v6
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
         with:
+          build-args: |
+            CLOUDCLI_REF=${{ env.CLOUDCLI_REF }}
+            CLAUDE_CODE_VERSION=${{ env.CLAUDE_CODE_VERSION }}
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform.arch }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.cache-meta.outputs.tags }}
+          cache-to: type=registry,ref=${{ steps.cache-meta.outputs.tags }},mode=max
+
+  delete-images:
+    name: Delete Unused Images from GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Delete untagged images from GHCR
+        uses: dataaxiom/ghcr-cleanup-action@v1
+      - name: Delete cache images from GHCR
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          delete-tags: 'cache-*'
+          keep-n-tagged: 6
